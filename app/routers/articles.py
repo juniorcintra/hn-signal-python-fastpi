@@ -18,12 +18,33 @@ async def list_articles(
     page_size: int = Query(20, ge=1, le=100, description="Items per page"),
     category: Optional[str] = Query(None, description="Filter by category"),
     tag: Optional[str] = Query(None, description="Filter by tag (substring match)"),
-    enrichment_status: Optional[EnrichmentStatus] = Query(
-        None, description="Filter by enrichment status"
+    enrichment_status: Optional[str] = Query(
+        None,
+        description=(
+            "Filter by enrichment status. "
+            f"Valid values: {[e.value for e in EnrichmentStatus]}"
+        ),
     ),
     db: AsyncSession = Depends(get_db),
 ) -> PaginatedArticlesResponse:
-    base_filter = _build_filters(category, tag, enrichment_status)
+    # Normalize empty strings (e.g. from ?param=) to None before any further processing
+    category = category or None
+    tag = tag or None
+
+    parsed_status: Optional[EnrichmentStatus] = None
+    if enrichment_status:
+        try:
+            parsed_status = EnrichmentStatus(enrichment_status)
+        except ValueError:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"Invalid enrichment_status '{enrichment_status}'. "
+                    f"Must be one of: {[e.value for e in EnrichmentStatus]}"
+                ),
+            )
+
+    base_filter = _build_filters(category, tag, parsed_status)
 
     total: int = await db.scalar(
         select(func.count()).select_from(Article).where(*base_filter)

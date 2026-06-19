@@ -119,6 +119,19 @@ class TestListArticles:
         assert data["total"] == 1
         assert data["items"][0]["hn_id"] == "40002"
 
+    async def test_empty_string_params_are_ignored(self, client: AsyncClient):
+        # Clients (e.g. Insomnia/Postman) sometimes send ?param= with no value;
+        # this must not cause a 422 — empty strings are treated as absent filters.
+        response = await client.get(
+            "/api/v1/articles?category=&tag=&enrichment_status="
+        )
+        assert response.status_code == 200
+
+    async def test_invalid_enrichment_status_returns_422(self, client: AsyncClient):
+        response = await client.get("/api/v1/articles?enrichment_status=unknown")
+        assert response.status_code == 422
+        assert "enrichment_status" in response.json()["detail"]
+
     async def test_invalid_page_returns_422(self, client: AsyncClient):
         assert (await client.get("/api/v1/articles?page=0")).status_code == 422
 

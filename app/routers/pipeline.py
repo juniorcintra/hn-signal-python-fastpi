@@ -13,8 +13,9 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ..config import settings
 from ..database import get_db
-from ..enrichment.llm_enricher import enrich_batch
+from ..enrichment.llm_enricher import enrich_batch, _client as llm_client
 from ..enums import EnrichmentStatus
 from ..models import Article
 from ..schemas import PipelineRunResponse, PipelineStatsResponse
@@ -22,6 +23,33 @@ from ..scraper.hn_scraper import scrape_hn_front_page
 
 router = APIRouter(prefix="/api/v1/pipeline", tags=["pipeline"])
 logger = logging.getLogger(__name__)
+
+
+@router.get("/test-llm")
+async def test_llm() -> dict:
+    """
+    Smoke-test the OpenAI connection with a minimal call (< 10 tokens).
+    Returns status ok/error without touching the database.
+    Use this to verify your API key and quota before running the pipeline.
+    """
+    try:
+        response = await llm_client.chat.completions.create(
+            model=settings.openai_model,
+            messages=[{"role": "user", "content": "Reply with the single word: ok"}],
+            max_tokens=5,
+        )
+        reply = response.choices[0].message.content or ""
+        return {
+            "status": "ok",
+            "model": settings.openai_model,
+            "reply": reply.strip(),
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "status": "error",
+            "model": settings.openai_model,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
 
 
 @router.post("/run", response_model=PipelineRunResponse)
