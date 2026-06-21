@@ -76,6 +76,27 @@ class PipelineStatsResponse(BaseModel):
     failed: int
 
 
+class JobResponse(BaseModel):
+    id: int
+    status: str
+    created_at: datetime
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    scraped: int
+    new_items: int
+    enriched: int
+    failed: int
+    error_message: Optional[str] = None
+
+    model_config = {"from_attributes": True}
+
+
+class JobStatusResponse(BaseModel):
+    job_id: int
+    status: str
+    message: str
+
+
 # ---------------------------------------------------------------------------
 # Health schema
 # ---------------------------------------------------------------------------

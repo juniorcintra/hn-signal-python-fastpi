@@ -20,5 +20,11 @@ class Settings(BaseSettings):
     llm_title_max_chars: int = 200
     llm_concurrency: int = 5
 
+    api_key: str = ""
+    rate_limit_per_minute: int = 10
+    
+    environment: str = "development"
+    log_level: str = "INFO"
+
 
 settings = Settings()

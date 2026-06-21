@@ -1,37 +1,49 @@
 """
-Pipeline router — scrape + enrich orchestration.
+Pipeline router — scrape + enrich orchestration with background jobs.
 
-The pipeline runs synchronously within the request for observability and simplicity.
-At ~10-15s for 30 articles it's acceptable; a production service would use
-Celery/RQ workers with a job-status polling endpoint.
+The pipeline now runs asynchronously in background to avoid blocking HTTP requests.
+Jobs can be tracked via status endpoint and only one job runs at a time.
 """
 
+import asyncio
 import logging
 from datetime import datetime
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ..background_jobs import get_running_job_id, run_pipeline_job
 from ..config import settings
 from ..database import get_db
-from ..enrichment.llm_enricher import enrich_batch, _client as llm_client
+from ..enrichment.llm_enricher import _client as llm_client
 from ..enums import EnrichmentStatus
+from ..job_models import JobStatus, PipelineJob
+from ..middleware import api_key_header, get_client_id, rate_limiter, verify_api_key
 from ..models import Article
-from ..schemas import PipelineRunResponse, PipelineStatsResponse
-from ..scraper.hn_scraper import scrape_hn_front_page
+from ..schemas import JobResponse, JobStatusResponse, PipelineStatsResponse
 
 router = APIRouter(prefix="/api/v1/pipeline", tags=["pipeline"])
 logger = logging.getLogger(__name__)
 
 
 @router.get("/test-llm")
-async def test_llm() -> dict:
+async def test_llm(
+    request: Request,
+    api_key: str | None = Depends(api_key_header),
+) -> dict:
     """
     Smoke-test the OpenAI connection with a minimal call (< 10 tokens).
     Returns status ok/error without touching the database.
     Use this to verify your API key and quota before running the pipeline.
+    
+    Requires API key authentication and is rate-limited.
     """
+    await verify_api_key(api_key)
+    
+    client_id = await get_client_id(request)
+    await rate_limiter.check_rate_limit(client_id)
+    
     try:
         response = await llm_client.chat.completions.create(
             model=settings.openai_model,
@@ -52,160 +64,76 @@ async def test_llm() -> dict:
         }
 
 
-@router.post("/run", response_model=PipelineRunResponse)
-async def run_pipeline(db: AsyncSession = Depends(get_db)) -> PipelineRunResponse:
+@router.post("/run", response_model=JobStatusResponse)
+async def run_pipeline(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    api_key: str | None = Depends(api_key_header),
+) -> JobStatusResponse:
     """
-    Full pipeline: scrape HN front page → upsert new articles → enrich pending items.
-
-    Already-enriched articles are never re-sent to the LLM (idempotent).
+    Start a background pipeline job: scrape HN front page → upsert → enrich pending items.
+    
+    Returns immediately with a job ID. Use GET /jobs/{job_id} to check status.
+    Only one pipeline job can run at a time to prevent race conditions.
+    
+    Requires API key authentication and is rate-limited.
     """
-    # 1. Scrape
-    try:
-        scraped_items = await scrape_hn_front_page()
-    except Exception as exc:
-        logger.error("Scraping failed: %s", exc)
-        raise HTTPException(status_code=502, detail=f"Scraping failed: {exc}") from exc
-
-    # 2. Upsert: insert new, refresh metadata for existing
-    new_count = 0
-    for item in scraped_items:
-        existing = await db.scalar(
-            select(Article).where(Article.hn_id == item["hn_id"])
+    await verify_api_key(api_key)
+    
+    client_id = await get_client_id(request)
+    await rate_limiter.check_rate_limit(client_id)
+    
+    running_job_id = await get_running_job_id()
+    if running_job_id is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Pipeline job {running_job_id} is already running. Wait for it to complete.",
         )
-        if existing is None:
-            db.add(Article(**item))
-            new_count += 1
-        else:
-            existing.points = item["points"]
-            existing.comments_count = item["comments_count"]
-            existing.rank = item["rank"]
-
+    
+    job = PipelineJob(status=JobStatus.pending)
+    db.add(job)
     await db.commit()
-
-    # 3. Collect all pending articles (includes any from previous failed runs)
-    pending_result = await db.execute(
-        select(Article).where(Article.enrichment_status == EnrichmentStatus.pending)
-    )
-    pending_articles = list(pending_result.scalars().all())
-
-    if not pending_articles:
-        return PipelineRunResponse(
-            scraped=len(scraped_items),
-            new_items=new_count,
-            enriched=0,
-            failed=0,
-            message="Pipeline completed — no pending articles to enrich",
-        )
-
-    # Mark as processing to prevent concurrent pipeline runs from re-picking them
-    for article in pending_articles:
-        article.enrichment_status = EnrichmentStatus.processing
-    await db.commit()
-
-    # 4. Batch enrich
-    article_payloads = [
-        {"hn_id": a.hn_id, "title": a.title, "url": a.url}
-        for a in pending_articles
-    ]
-    enrichment_results = await enrich_batch(article_payloads)
-
-    # 5. Persist enrichment results
-    enriched_count = 0
-    failed_count = 0
-
-    for hn_id, enrichment, error in enrichment_results:
-        article = await db.scalar(select(Article).where(Article.hn_id == hn_id))
-        if article is None:
-            continue
-
-        if enrichment is not None:
-            article.summary = enrichment.summary
-            article.category = enrichment.category
-            article.tags = enrichment.tags
-            article.technical_level = enrichment.technical_level
-            article.sentiment = enrichment.sentiment
-            article.enrichment_status = EnrichmentStatus.completed
-            article.enriched_at = datetime.utcnow()
-            article.enrichment_error = None
-            enriched_count += 1
-        else:
-            article.enrichment_status = EnrichmentStatus.failed
-            article.enrichment_error = error
-            failed_count += 1
-
-    await db.commit()
-
-    return PipelineRunResponse(
-        scraped=len(scraped_items),
-        new_items=new_count,
-        enriched=enriched_count,
-        failed=failed_count,
-        message="Pipeline completed successfully",
+    await db.refresh(job)
+    
+    asyncio.create_task(run_pipeline_job(job.id))
+    
+    return JobStatusResponse(
+        job_id=job.id,
+        status=job.status.value,
+        message=f"Pipeline job {job.id} started in background",
     )
 
 
-@router.post("/retry", response_model=PipelineRunResponse)
-async def retry_failed(db: AsyncSession = Depends(get_db)) -> PipelineRunResponse:
+@router.get("/jobs/{job_id}", response_model=JobResponse)
+async def get_job_status(
+    job_id: int,
+    db: AsyncSession = Depends(get_db),
+) -> JobResponse:
     """
-    Re-enrich only articles that previously failed enrichment.
-    Useful for recovering from transient LLM outages without re-scraping.
+    Get the status and results of a pipeline job.
     """
-    failed_result = await db.execute(
-        select(Article).where(Article.enrichment_status == EnrichmentStatus.failed)
+    job = await db.get(PipelineJob, job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+    
+    return JobResponse.model_validate(job)
+
+
+@router.get("/jobs", response_model=list[JobResponse])
+async def list_jobs(
+    limit: int = 10,
+    db: AsyncSession = Depends(get_db),
+) -> list[JobResponse]:
+    """
+    List recent pipeline jobs, ordered by creation time (newest first).
+    """
+    result = await db.execute(
+        select(PipelineJob)
+        .order_by(PipelineJob.created_at.desc())
+        .limit(limit)
     )
-    failed_articles = list(failed_result.scalars().all())
-
-    if not failed_articles:
-        return PipelineRunResponse(
-            scraped=0,
-            new_items=0,
-            enriched=0,
-            failed=0,
-            message="No failed articles to retry",
-        )
-
-    for article in failed_articles:
-        article.enrichment_status = EnrichmentStatus.processing
-    await db.commit()
-
-    article_payloads = [
-        {"hn_id": a.hn_id, "title": a.title, "url": a.url}
-        for a in failed_articles
-    ]
-    enrichment_results = await enrich_batch(article_payloads)
-
-    enriched_count = 0
-    failed_count = 0
-
-    for hn_id, enrichment, error in enrichment_results:
-        article = await db.scalar(select(Article).where(Article.hn_id == hn_id))
-        if article is None:
-            continue
-
-        if enrichment is not None:
-            article.summary = enrichment.summary
-            article.category = enrichment.category
-            article.tags = enrichment.tags
-            article.technical_level = enrichment.technical_level
-            article.sentiment = enrichment.sentiment
-            article.enrichment_status = EnrichmentStatus.completed
-            article.enriched_at = datetime.utcnow()
-            article.enrichment_error = None
-            enriched_count += 1
-        else:
-            article.enrichment_status = EnrichmentStatus.failed
-            article.enrichment_error = error
-            failed_count += 1
-
-    await db.commit()
-
-    return PipelineRunResponse(
-        scraped=0,
-        new_items=0,
-        enriched=enriched_count,
-        failed=failed_count,
-        message=f"Retry completed: {enriched_count} recovered, {failed_count} still failing",
-    )
+    jobs = result.scalars().all()
+    return [JobResponse.model_validate(job) for job in jobs]
 
 
 @router.get("/stats", response_model=PipelineStatsResponse)
