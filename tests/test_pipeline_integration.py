@@ -230,16 +230,23 @@ async def test_concurrent_pipeline_prevention(db_session):
     await db_session.refresh(job1)
     await db_session.refresh(job2)
     
+    async def slow_scrape():
+        await asyncio.sleep(0.5)  # Simulate slow scraping
+        return []
+    
     async def slow_pipeline():
         with patch("app.background_jobs.scrape_hn_front_page", new_callable=AsyncMock) as mock_scrape:
-            mock_scrape.return_value = []
+            mock_scrape.side_effect = slow_scrape
             await run_pipeline_job(job1.id)
     
     task1 = asyncio.create_task(slow_pipeline())
     
-    await asyncio.sleep(0.1)
+    await asyncio.sleep(0.2)  # Wait for job1 to acquire lock
     
-    await run_pipeline_job(job2.id)
+    # Mock the second job call too to avoid real API calls
+    with patch("app.background_jobs.scrape_hn_front_page", new_callable=AsyncMock) as mock_scrape2:
+        mock_scrape2.return_value = []
+        await run_pipeline_job(job2.id)
     
     await task1
     

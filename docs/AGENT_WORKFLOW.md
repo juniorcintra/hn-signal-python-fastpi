@@ -603,3 +603,260 @@ Planejado para próxima iteração:
 4. Script de migração de tags (JSON → relacional)
 
 Documentado em `ROADMAP.md` com timeline e priorização.
+
+---
+
+## Iteração 6 — Correção de Testes (Erro do Agente)
+
+### Contexto
+
+Após finalizar toda a documentação e preparar o projeto para entrega, o usuário rodou os testes para validação final:
+
+```bash
+pytest tests/ -v
+```
+
+**Resultado:** 8 testes falharam (44 passaram)
+
+### Problema Identificado
+
+O agente cometeu um **erro crítico** ao implementar a v2.0:
+
+#### Erro 1: Tabela `pipeline_jobs` não criada nos testes
+
+**Sintoma:**
+
+```
+sqlite3.OperationalError: no such table: pipeline_jobs
+```
+
+**Causa Raiz:**
+
+- Modelo `PipelineJob` foi criado em `app/job_models.py`
+- `tests/conftest.py` não importava esse modelo
+- SQLAlchemy não sabia que a tabela existia ao executar `Base.metadata.create_all()`
+- Testes de integração falhavam ao tentar usar `PipelineJob`
+
+**Arquivos afetados:**
+
+- `test_pipeline_integration.py` - 5 testes falharam
+- `test_api.py` - 3 testes falharam (efeito colateral)
+
+#### Erro 2: Estado compartilhado entre testes
+
+**Sintoma:**
+
+```python
+assert data["total"] == 5  # Falhou: total era 6
+assert data["total"] == 0  # Falhou: total era 16
+```
+
+**Causa Raiz:**
+
+- Fixture `db_session` fazia rollback, mas dados já commitados permaneciam
+- Testes anteriores deixavam dados no banco in-memory compartilhado
+- Contadores de total ficavam incorretos
+
+### Por Que o Agente Errou
+
+1. **Falta de validação:** Implementou v2.0 sem rodar os testes
+2. **Import implícito:** Assumiu que `PipelineJob` seria importado automaticamente
+3. **Teste de isolamento:** Não considerou que testes compartilham estado em sessão
+
+### Correção Manual pelo Usuário
+
+O usuário identificou o problema e solicitou a correção. O agente então implementou:
+
+#### Fix 1: Importar modelos no conftest
+
+```python
+# tests/conftest.py
+from app.database import Base, get_db
+from app.job_models import PipelineJob  # noqa: F401 - Import necessário
+from app.main import app
+from app.models import Article  # noqa: F401 - Import necessário
+```
+
+**Justificativa:**
+
+- SQLAlchemy precisa que os modelos sejam importados antes de `create_all()`
+- `# noqa: F401` silencia warning de "import não usado" (é usado via metaclass)
+
+#### Fix 2: Limpar tabelas entre testes
+
+```python
+@pytest_asyncio.fixture
+async def db_session() -> AsyncSession:
+    """Provide a database session that rolls back after each test."""
+    async with _SESSION_FACTORY() as session:
+        # Limpar tabelas antes de cada teste
+        await session.execute(Article.__table__.delete())
+        await session.execute(PipelineJob.__table__.delete())
+        await session.commit()
+
+        yield session
+        await session.rollback()
+```
+
+**Justificativa:**
+
+- Garante que cada teste começa com banco limpo
+- Previne vazamento de estado entre testes
+- Rollback sozinho não é suficiente para dados já commitados
+
+### Validação
+
+Após as correções:
+
+```bash
+pytest tests/ -v
+```
+
+**Resultado esperado:** 52 testes passando ✅
+
+### Lições Aprendidas
+
+#### O que o agente deveria ter feito:
+
+1. **Rodar testes após cada mudança significativa**
+   - Especialmente ao adicionar novos modelos
+   - Validar que fixtures de teste cobrem novos componentes
+
+2. **Entender imports do SQLAlchemy**
+   - Modelos precisam ser importados explicitamente
+   - Metaclass `Base` registra modelos apenas se importados
+
+3. **Considerar isolamento de testes**
+   - Banco in-memory compartilhado requer limpeza explícita
+   - Rollback não limpa dados de outras sessões
+
+#### Processo correto para adicionar modelo:
+
+1. Criar modelo (`app/job_models.py`)
+2. Importar no `conftest.py` ✅
+3. Adicionar limpeza no fixture `db_session` ✅
+4. Rodar testes para validar ✅
+5. Criar testes específicos para o modelo ✅
+
+### Impacto
+
+- **Tempo perdido:** ~5 minutos para identificar e corrigir
+- **Gravidade:** Alta (testes falhando = projeto não entregável)
+- **Aprendizado:** Validação contínua é essencial, mesmo para agentes
+
+### Solução Implementada (Após Múltiplas Tentativas)
+
+Após várias tentativas de patch e monkeypatch que falharam, a **solução definitiva** foi:
+
+#### 1. Usar arquivo SQLite temporário ao invés de `:memory:`
+
+**Problema:** SQLite in-memory com `StaticPool` não estava compartilhando corretamente entre múltiplas sessões assíncronas.
+
+**Solução:**
+
+```python
+import tempfile
+
+_TEST_DB_FILE = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+_TEST_DB_PATH = _TEST_DB_FILE.name
+_TEST_DB_FILE.close()
+
+_TEST_ENGINE = create_async_engine(
+    f"sqlite+aiosqlite:///{_TEST_DB_PATH}",
+    connect_args={"check_same_thread": False},
+    future=True,
+)
+```
+
+#### 2. Patch de todos os módulos que usam `AsyncSessionLocal`
+
+```python
+import app.database
+app.database.engine = _TEST_ENGINE
+app.database.AsyncSessionLocal = _TEST_SESSION_FACTORY
+
+import app.background_jobs
+app.background_jobs.AsyncSessionLocal = _TEST_SESSION_FACTORY
+
+import app.main
+app.main.AsyncSessionLocal = _TEST_SESSION_FACTORY
+```
+
+#### 3. Criar app sem lifespan para testes
+
+```python
+from fastapi import FastAPI
+import app.main as main_module
+
+app = FastAPI(
+    title="HN Article Enricher",
+    description="Test version without lifespan",
+    version="1.0.0",
+)
+app.router = main_module.app.router
+```
+
+#### 4. Limpeza de tabelas no fixture `db_session`
+
+```python
+@pytest_asyncio.fixture
+async def db_session(_setup_test_db) -> AsyncSession:
+    async with _TEST_SESSION_FACTORY() as session:
+        await session.execute(Article.__table__.delete())
+        await session.execute(PipelineJob.__table__.delete())
+        await session.commit()
+        yield session
+        await session.rollback()
+```
+
+#### 5. Corrigir mocks em `test_pipeline_integration.py`
+
+Adicionar mock faltante e delay para simular pipeline lento:
+
+```python
+async def slow_scrape():
+    await asyncio.sleep(0.5)
+    return []
+
+async def slow_pipeline():
+    with patch("app.background_jobs.scrape_hn_front_page", new_callable=AsyncMock) as mock_scrape:
+        mock_scrape.side_effect = slow_scrape
+        await run_pipeline_job(job1.id)
+```
+
+### Arquivos Modificados
+
+1. **`tests/conftest.py`** - Reescrito completamente
+   - Arquivo SQLite temporário
+   - Patch de 3 módulos
+   - App sem lifespan
+   - Limpeza de tabelas
+
+2. **`tests/test_pipeline_integration.py`**
+   - Mock adicionado para `test_concurrent_pipeline_prevention`
+   - Delay para simular pipeline lento
+
+### Resultado Final
+
+```bash
+pytest tests/ --cov=app --cov-report=html
+```
+
+**✅ 52 passed, 21 warnings in 9.74s**
+
+- **Cobertura:** Mantida em ~85%
+- **Todos os testes passando**
+- **Problema de "no such table" 100% resolvido**
+- **Problema de estado compartilhado 100% resolvido**
+
+### Lições Aprendidas
+
+1. **SQLite in-memory + async + StaticPool** é problemático - arquivo temporário é mais confiável
+2. **Múltiplos engines** podem ser criados em diferentes momentos - patch deve ser feito **antes** de qualquer import
+3. **Lifespan do FastAPI** pode interferir com setup de testes - criar app sem lifespan é mais seguro
+4. **Mocks devem cobrir todas as chamadas** - uma chamada não mockada pode fazer requests reais
+5. **Testes de concorrência** precisam de delays realistas para funcionar corretamente
+
+---
+
+**Status Final:** ✅ Todos os 52 testes passando, projeto pronto para entrega.
