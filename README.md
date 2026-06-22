@@ -11,46 +11,26 @@ A FastAPI service that scrapes Hacker News front page, enriches each article wit
 - **tenacity** — retry with exponential backoff
 - **Pydantic v2** — config and schema validation
 
-## Setup
+## Quick Start
 
 ```bash
-# 1. Create and activate a virtual environment
-python -m venv .venv
-.venv\Scripts\activate        # Windows
-# source .venv/bin/activate   # Linux/macOS
-
-# 2. Install dependencies
+# 1. Install dependencies
 pip install -r requirements.txt
 
-# 3. Configure environment
+# 2. Configure .env (set OPENAI_API_KEY)
 cp .env.example .env
-# Edit .env and set your OPENAI_API_KEY
 
-# 4. Generate API key (optional, for authentication)
-python -c "import secrets; print(secrets.token_urlsafe(32))"
-# Copy the output and add to .env as API_KEY=<generated-key>
+# 3. Run migrations
+alembic upgrade head
 
-# 5. Run the server
+# 4. Start server
 uvicorn app.main:app --reload
 ```
 
+**📖 For detailed setup instructions, see [QUICKSTART.md](./docs/QUICKSTART.md)**
+
 The API will be available at `http://localhost:8000`.  
 Interactive docs: `http://localhost:8000/docs`
-
-## Database Migrations
-
-This project uses Alembic for database migrations:
-
-```bash
-# Apply all pending migrations
-alembic upgrade head
-
-# Create a new migration after model changes
-alembic revision --autogenerate -m "description"
-
-# Rollback last migration
-alembic downgrade -1
-```
 
 ## Running tests
 
