@@ -19,7 +19,9 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from sqlalchemy.pool import StaticPool
 
 from app.database import Base, get_db
+from app.job_models import PipelineJob  # noqa: F401 - Import necessário para criar tabela
 from app.main import app
+from app.models import Article  # noqa: F401 - Import necessário para criar tabela
 
 _SHARED_ENGINE = create_async_engine(
     "sqlite+aiosqlite:///:memory:",
@@ -43,6 +45,11 @@ async def _create_tables():
 async def db_session() -> AsyncSession:
     """Provide a database session that rolls back after each test."""
     async with _SESSION_FACTORY() as session:
+        # Limpar tabelas antes de cada teste
+        await session.execute(Article.__table__.delete())
+        await session.execute(PipelineJob.__table__.delete())
+        await session.commit()
+        
         yield session
         await session.rollback()
 
