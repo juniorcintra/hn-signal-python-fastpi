@@ -15,6 +15,12 @@ class Settings(BaseSettings):
 
     scraper_timeout: int = 30
     scraper_max_retries: int = 3
+    
+    selenium_headless: bool = True
+    selenium_wait_timeout: int = 10
+    selenium_page_load_timeout: int = 30
+    selenium_scroll_pause_time: float = 2.0
+    selenium_max_scrolls: int = 10
 
     llm_max_tokens: int = 400
     llm_title_max_chars: int = 200
