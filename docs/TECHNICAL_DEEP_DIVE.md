@@ -7,6 +7,7 @@ Este documento explica **o que foi construído, por quê, e as decisões técnic
 ## 🎯 **O Problema de Negócio**
 
 Criar um serviço que:
+
 1. **Coleta** artigos do Hacker News automaticamente
 2. **Enriquece** cada artigo com IA (categorização, tags, resumo, análise)
 3. **Expõe** via API REST para consumo
@@ -22,6 +23,7 @@ Criar um serviço que:
 **Escolha:** FastAPI + SQLAlchemy async + aiosqlite + httpx
 
 **Por quê:**
+
 - **I/O-bound workload:** Scraping e chamadas LLM são operações de rede
 - **Concorrência eficiente:** Async permite processar múltiplos artigos simultaneamente sem threads
 - **Escalabilidade:** 1 worker async > 10 workers síncronos para esse tipo de carga
@@ -33,6 +35,7 @@ Criar um serviço que:
 ### **2. Separação de Responsabilidades (Clean Architecture)**
 
 **Estrutura:**
+
 ```
 app/
 ├── models.py          # Domínio (entidades)
@@ -44,6 +47,7 @@ app/
 ```
 
 **Por quê:**
+
 - **Testabilidade:** Cada camada pode ser testada isoladamente
 - **Manutenibilidade:** Mudança no scraper não afeta a API
 - **Substituibilidade:** Trocar SQLite por Postgres = mudar 1 arquivo
@@ -61,14 +65,17 @@ O projeto funcionava, mas tinha **5 gaps críticos para produção:**
 #### **1. Pipeline Síncrono Bloqueante**
 
 **Problema:**
+
 ```
 Cliente → POST /pipeline/run → [espera 15s] → Resposta
 ```
+
 - Request HTTP bloqueada por 15 segundos
 - Timeout em proxies/load balancers
 - UX horrível
 
 **Solução v2.0: Background Jobs**
+
 ```
 Cliente → POST /pipeline/run → [<100ms] → {job_id: 1}
 Cliente → GET /jobs/1 → {status: "running"}
@@ -76,6 +83,7 @@ Cliente → GET /jobs/1 → {status: "completed", enriched: 28}
 ```
 
 **Decisão técnica:**
+
 - **asyncio.create_task()** ao invés de Celery/RQ
 - **Trade-off:** Simplicidade vs Robustez
 - **Justificativa:** Single-instance, sem dependências externas, migração futura fácil
@@ -87,6 +95,7 @@ Cliente → GET /jobs/1 → {status: "completed", enriched: 28}
 #### **2. Sem Proteção de Custos**
 
 **Problema:**
+
 - Endpoints `/pipeline/run` e `/test-llm` chamam OpenAI
 - Qualquer pessoa na internet pode gerar custo
 - Sem rate limiting = DDoS fácil
@@ -94,16 +103,19 @@ Cliente → GET /jobs/1 → {status: "completed", enriched: 28}
 **Solução v2.0: Autenticação + Rate Limiting**
 
 **Autenticação:**
+
 - API Key via header `X-API-Key`
 - Configurável (pode desabilitar em dev)
 - Simples mas efetivo
 
 **Rate Limiting:**
+
 - In-memory (10 req/min padrão)
 - Por IP do cliente
 - Suporta X-Forwarded-For (proxy-aware)
 
 **Decisão técnica:**
+
 - **In-memory** ao invés de Redis
 - **Trade-off:** Não funciona em multi-instance vs Zero dependências
 - **Justificativa:** Adequado para MVP, documentado como limitação
@@ -115,6 +127,7 @@ Cliente → GET /jobs/1 → {status: "completed", enriched: 28}
 #### **3. Race Conditions**
 
 **Problema:**
+
 ```
 Request A → Inicia pipeline → Marca artigos como "processing"
 Request B → Inicia pipeline → Marca MESMOS artigos como "processing"
@@ -124,11 +137,13 @@ Resultado: Artigos enriquecidos 2x, custo duplicado
 **Solução v2.0: Lock Global**
 
 **Implementação:**
+
 - Lock em memória usando `asyncio.Lock()`
 - Variável global rastreia job em execução
 - Tentativas concorrentes retornam HTTP 409 (Conflict)
 
 **Decisão técnica:**
+
 - Lock em memória (não distribuído)
 - **Trade-off:** Funciona apenas single-instance
 - **Justificativa:** Previne 99% dos casos, documentado para escala futura
@@ -140,6 +155,7 @@ Resultado: Artigos enriquecidos 2x, custo duplicado
 #### **4. Schema Evolution Manual**
 
 **Problema:**
+
 - Mudanças no banco = editar código + rodar CREATE TABLE manual
 - Sem histórico de mudanças
 - Rollback impossível
@@ -148,11 +164,13 @@ Resultado: Artigos enriquecidos 2x, custo duplicado
 **Solução v2.0: Alembic**
 
 **O que é:**
+
 - Sistema de migrações versionadas
 - Cada mudança = 1 arquivo Python
 - Upgrade/downgrade automático
 
 **Decisão técnica:**
+
 - Configurado para **async** (compatível com aiosqlite)
 - Migração inicial `001_initial_schema.py` com schema completo
 - Integrado ao `init_db()` para importar modelos automaticamente
@@ -164,6 +182,7 @@ Resultado: Artigos enriquecidos 2x, custo duplicado
 #### **5. Testes Superficiais**
 
 **Problema v1.0:**
+
 - Testes unitários de parser ✅
 - Testes de schema Pydantic ✅
 - Testes de API básicos ✅
@@ -172,6 +191,7 @@ Resultado: Artigos enriquecidos 2x, custo duplicado
 **Solução v2.0: Testes de Integração**
 
 **O que foi adicionado:**
+
 ```
 test_pipeline_integration.py:
 - Fluxo completo: scrape → upsert → enrich
@@ -200,6 +220,7 @@ test_auth_and_rate_limit.py:
 **Problema:** OpenAI pode retornar 429 (rate limit) ou 500 (erro temporário)
 
 **Solução:** Biblioteca `tenacity`
+
 ```python
 @retry(
     stop=stop_after_attempt(3),
@@ -209,6 +230,7 @@ test_auth_and_rate_limit.py:
 ```
 
 **Por quê:**
+
 - **Resiliência:** Falhas temporárias não quebram o pipeline
 - **Custo:** Evita perder artigos já scraped
 - **UX:** Usuário não precisa re-executar manualmente
@@ -222,6 +244,7 @@ test_auth_and_rate_limit.py:
 **Problema:** OpenAI pode retornar JSON malformado ou com campos faltando
 
 **Solução:** Schema Pydantic valida resposta
+
 ```python
 class ArticleEnrichment(BaseModel):
     summary: Annotated[str, Field(min_length=10, max_length=500)]
@@ -230,6 +253,7 @@ class ArticleEnrichment(BaseModel):
 ```
 
 **Por quê:**
+
 - **Fail-fast:** Erro detectado imediatamente
 - **Type-safe:** IDE autocomplete, mypy validation
 - **Documentação viva:** Schema = contrato
@@ -241,16 +265,19 @@ class ArticleEnrichment(BaseModel):
 ### **3. Logs Estruturados**
 
 **Antes:**
+
 ```
 INFO: Pipeline started
 ```
 
 **Depois:**
+
 ```
 2024-01-01 12:00:00 [INFO] app.background_jobs [background_jobs.py:85] — Job 1 completed: scraped=30, new=25, enriched=24, failed=1
 ```
 
 **Por quê:**
+
 - **Debugging:** Saber exatamente onde e quando
 - **Métricas:** Parsear logs para dashboards
 - **Produção:** Rastrear requests através de múltiplos serviços
@@ -264,6 +291,7 @@ INFO: Pipeline started
 **Problema:** Dev usa SQLite, produção usa Postgres. Como gerenciar?
 
 **Solução:** Pydantic Settings
+
 ```python
 class Settings(BaseSettings):
     database_url: str = "sqlite+aiosqlite:///./hn_articles.db"
@@ -273,11 +301,13 @@ class Settings(BaseSettings):
 ```
 
 **Carrega de:**
+
 1. Variáveis de ambiente
 2. Arquivo `.env`
 3. Defaults no código
 
 **Por quê:**
+
 - **12-factor app:** Configuração separada do código
 - **Segurança:** Secrets em env vars, não hardcoded
 - **Flexibilidade:** Mesmo código em dev/staging/prod
@@ -301,6 +331,7 @@ class Settings(BaseSettings):
 ```
 
 **Por quê essa distribuição:**
+
 - **Unit:** Rápidos, isolados, muitos
 - **Integration:** Fluxo real, mocks externos, médio
 - **E2E:** Completo, lento, poucos
@@ -312,6 +343,7 @@ class Settings(BaseSettings):
 ### **Mocks Inteligentes**
 
 **Exemplo:**
+
 ```python
 @patch("app.background_jobs.scrape_hn_front_page")
 @patch("app.background_jobs.enrich_batch")
@@ -321,6 +353,7 @@ async def test_pipeline(mock_scrape, mock_enrich):
 ```
 
 **Por quê:**
+
 - **Determinístico:** Testes não dependem de HN estar online
 - **Rápido:** Sem chamadas de rede reais
 - **Controlável:** Simular falhas específicas
@@ -333,14 +366,14 @@ async def test_pipeline(mock_scrape, mock_enrich):
 
 ### **O que mudou v1.0 → v2.0:**
 
-| Aspecto | v1.0 | v2.0 | Impacto |
-|---------|------|------|---------|
-| **Latência** | 15s | <100ms | UX |
-| **Segurança** | Nenhuma | API Key + Rate Limit | Custo |
-| **Concorrência** | Race conditions | Lock global | Correção |
-| **Migrações** | Manual | Alembic | Ops |
-| **Testes** | 60% | 85% | Confiança |
-| **Logs** | Básicos | Estruturados | Debug |
+| Aspecto          | v1.0            | v2.0                 | Impacto   |
+| ---------------- | --------------- | -------------------- | --------- |
+| **Latência**     | 15s             | <100ms               | UX        |
+| **Segurança**    | Nenhuma         | API Key + Rate Limit | Custo     |
+| **Concorrência** | Race conditions | Lock global          | Correção  |
+| **Migrações**    | Manual          | Alembic              | Ops       |
+| **Testes**       | 60%             | 85%                  | Confiança |
+| **Logs**         | Básicos         | Estruturados         | Debug     |
 
 **Visão Sênior:** Métricas não são vaidade. São **indicadores de maturidade**. Latência = UX. Cobertura = confiança. Logs = observabilidade.
 
@@ -351,6 +384,7 @@ async def test_pipeline(mock_scrape, mock_enrich):
 ### **1. Trade-offs Conscientes**
 
 Toda decisão tem **custo-benefício**:
+
 - asyncio vs Celery: Simplicidade vs Robustez
 - In-memory vs Redis: Zero deps vs Escalabilidade
 - SQLite vs Postgres: Setup rápido vs Performance
@@ -362,6 +396,7 @@ Toda decisão tem **custo-benefício**:
 ### **2. Evolução Incremental**
 
 v1.0 → v2.0 não foi reescrita. Foi **evolução**:
+
 - Backward compatible (dados preservados)
 - Features adicionadas, não substituídas
 - Documentação de limitações e próximos passos
@@ -370,9 +405,60 @@ v1.0 → v2.0 não foi reescrita. Foi **evolução**:
 
 ---
 
-### **3. Documentação como Código**
+### **3. Endpoints Administrativos**
+
+**Problema:** Jobs de enriquecimento podem ser interrompidos (restart do servidor, erro não tratado, timeout) deixando artigos travados em status `processing` permanentemente.
+
+**Solução:** Endpoint `POST /api/v1/pipeline/reset-stuck-processing`
+
+```python
+@router.post("/reset-stuck-processing")
+async def reset_stuck_processing(
+    db: AsyncSession = Depends(get_db),
+    api_key: str | None = Depends(api_key_header),
+) -> dict:
+    """Reset articles stuck in 'processing' status back to 'pending'."""
+    result = await db.execute(
+        select(Article).where(Article.enrichment_status == EnrichmentStatus.processing)
+    )
+    stuck_articles = result.scalars().all()
+
+    for article in stuck_articles:
+        article.enrichment_status = EnrichmentStatus.pending
+        logger.info(f"Reset article {article.hn_id} from processing to pending")
+
+    await db.commit()
+
+    return {
+        "status": "ok",
+        "reset_count": len(stuck_articles),
+        "article_ids": [article.hn_id for article in stuck_articles],
+    }
+```
+
+**Por quê:**
+
+- **Recuperação de falhas:** Permite recuperar de interrupções sem intervenção manual no banco
+- **Operacional:** Administrador pode resolver problema via API, não SQL direto
+- **Auditável:** Logs registram quais artigos foram resetados e quando
+- **Seguro:** Requer autenticação via API key
+
+**Cenário real:**
+
+1. Pipeline rodando, enriquecendo 30 artigos
+2. Servidor reinicia (deploy, crash, etc)
+3. 2 artigos ficam com status `processing` (estavam sendo processados)
+4. Admin chama `POST /reset-stuck-processing`
+5. Artigos voltam para `pending` e serão reprocessados no próximo pipeline
+
+**Visão Sênior:** Sistemas falham. A questão não é evitar 100% das falhas, mas **ter ferramentas para recuperar rapidamente**. Endpoint administrativo > acesso direto ao banco.
+
+---
+
+### **4. Documentação como Código**
 
 Não é README genérico. É:
+
 - **IMPROVEMENTS.md:** Decisões técnicas detalhadas
 - **MIGRATION_GUIDE.md:** Passo a passo de upgrade
 - **ROADMAP.md:** Planejamento de features
@@ -385,6 +471,7 @@ Não é README genérico. É:
 ### **4. Pensamento em Produção**
 
 Features v2.0 não são "legais de ter". São **requisitos de produção**:
+
 - Background jobs = não bloquear usuário
 - Auth = não gerar custo infinito
 - Migrações = deploy sem downtime
@@ -399,7 +486,8 @@ Features v2.0 não são "legais de ter". São **requisitos de produção**:
 ### **Pergunta: "Explique uma decisão técnica difícil"**
 
 **Resposta:**
-> "No projeto de enrichment de artigos, tive que escolher entre Celery (robusto, battle-tested) e asyncio tasks (simples, sem deps). 
+
+> "No projeto de enrichment de artigos, tive que escolher entre Celery (robusto, battle-tested) e asyncio tasks (simples, sem deps).
 >
 > **Contexto:** Single-instance, MVP, time pequeno.
 >
@@ -416,6 +504,7 @@ Features v2.0 não são "legais de ter". São **requisitos de produção**:
 ### **Pergunta: "Como você garante qualidade?"**
 
 **Resposta:**
+
 > "Pirâmide de testes: muitos unit (parser, schemas), médio integration (API, auth), poucos E2E (fluxo completo).
 >
 > Cobertura de 85%, mas **foco em cenários reais**: falhas parciais, retry, idempotência.
@@ -427,9 +516,11 @@ Features v2.0 não são "legais de ter". São **requisitos de produção**:
 ### **Pergunta: "Como você lida com falhas?"**
 
 **Resposta:**
+
 > "Sistemas distribuídos falham. Não é 'se', é 'quando'.
 >
 > **Estratégia:**
+>
 > - Retry com backoff exponencial (transient failures)
 > - Circuit breaker pattern (persistent failures)
 > - Graceful degradation (falha parcial ≠ falha total)

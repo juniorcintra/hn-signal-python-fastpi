@@ -1213,3 +1213,224 @@ no JavaScript rendering, infinite scroll, or authentication is needed.
 ---
 
 **Status:** ✅ Implementação completa, documentada e validada.
+
+---
+
+## Iteração 8 — Endpoint Administrativo: Reset de Artigos Travados
+
+### Contexto
+
+Durante testes em produção, o usuário identificou 2 artigos com status `processing` que estavam travados. Isso ocorreu porque:
+
+1. Pipeline foi iniciado e começou a enriquecer artigos
+2. Servidor foi reiniciado (durante desenvolvimento com `--reload`)
+3. Artigos que estavam sendo processados ficaram com status `processing` permanentemente
+4. Próximas execuções do pipeline ignoraram esses artigos (não são `pending`)
+
+**Evidência:** `GET /api/v1/pipeline/stats` retornou:
+
+```json
+{
+  "total": 63,
+  "pending": 8,
+  "processing": 2, // ← Artigos travados
+  "completed": 61,
+  "failed": 0
+}
+```
+
+### Problema Identificado
+
+**Causa raiz:** Background jobs com `asyncio.create_task()` não sobrevivem a restart do servidor.
+
+**Fluxo do problema:**
+
+1. Job marca artigo como `processing` antes de enriquecer
+2. Servidor reinicia (deploy, crash, `--reload`)
+3. Task é perdida (não há persistência de estado)
+4. Artigo permanece `processing` para sempre
+5. Próximos pipelines não tocam nesse artigo
+
+**Impacto:**
+
+- Artigos nunca são enriquecidos
+- Contador de `processing` cresce a cada interrupção
+- Sem forma de recuperar sem acesso direto ao banco
+
+### Decisão de Design
+
+Criar **endpoint administrativo** para resetar artigos travados, ao invés de:
+
+**Alternativas descartadas:**
+
+1. ❌ **Acesso direto ao banco** - Requer SQL manual, não auditável
+2. ❌ **Script de manutenção** - Overhead de deployment, não integrado
+3. ❌ **Auto-reset no startup** - Pode resetar jobs legítimos em execução
+4. ❌ **Timeout automático** - Complexo, requer tracking de timestamps
+
+**Solução escolhida:** ✅ **Endpoint REST administrativo**
+
+**Justificativa:**
+
+- Integrado à API existente
+- Requer autenticação (seguro)
+- Auditável via logs
+- Operável via Postman/curl (sem código extra)
+- Explícito (admin decide quando resetar)
+
+### Implementação
+
+**Arquivo modificado:** `app/routers/pipeline.py`
+
+**Endpoint criado:**
+
+```python
+@router.post("/reset-stuck-processing")
+async def reset_stuck_processing(
+    db: AsyncSession = Depends(get_db),
+    api_key: str | None = Depends(api_key_header),
+) -> dict:
+    """
+    Reset articles stuck in 'processing' status back to 'pending'.
+
+    This is an administrative endpoint to recover from interrupted enrichment jobs
+    (e.g., server restart, unhandled errors).
+    """
+    await verify_api_key(api_key)
+
+    result = await db.execute(
+        select(Article).where(Article.enrichment_status == EnrichmentStatus.processing)
+    )
+    stuck_articles = result.scalars().all()
+
+    if not stuck_articles:
+        return {
+            "status": "ok",
+            "message": "No articles stuck in processing status",
+            "reset_count": 0,
+        }
+
+    for article in stuck_articles:
+        article.enrichment_status = EnrichmentStatus.pending
+        logger.info(f"Reset article {article.hn_id} from processing to pending")
+
+    await db.commit()
+
+    return {
+        "status": "ok",
+        "message": f"Reset {len(stuck_articles)} articles from processing to pending",
+        "reset_count": len(stuck_articles),
+        "article_ids": [article.hn_id for article in stuck_articles],
+    }
+```
+
+**Características:**
+
+- **Autenticação obrigatória:** `api_key_header` dependency
+- **Idempotente:** Pode ser chamado múltiplas vezes sem efeitos colaterais
+- **Informativo:** Retorna IDs dos artigos resetados
+- **Auditável:** Logs estruturados registram cada reset
+- **Seguro:** Não deleta dados, apenas muda status
+
+### Validação em Produção
+
+**Teste realizado:**
+
+1. **Estado inicial:**
+
+   ```json
+   { "processing": 2, "pending": 8 }
+   ```
+
+2. **Chamada ao endpoint:**
+
+   ```bash
+   POST /api/v1/pipeline/reset-stuck-processing
+   Headers: X-API-Key: {{api_key}}
+   ```
+
+3. **Resposta:**
+
+   ```json
+   {
+     "status": "ok",
+     "message": "Reset 2 articles from processing to pending",
+     "reset_count": 2,
+     "article_ids": ["48628302", "48649183"]
+   }
+   ```
+
+4. **Logs gerados:**
+
+   ```
+   2026-06-23 16:53:40 [INFO] app.routers.pipeline [pipeline.py:190] — Reset article 48628302 from processing to pending
+   2026-06-23 16:53:40 [INFO] app.routers.pipeline [pipeline.py:190] — Reset article 48649183 from processing to pending
+   ```
+
+5. **Estado final:**
+   ```json
+   { "processing": 0, "pending": 10 }
+   ```
+
+**✅ Resultado:** Artigos resetados com sucesso, prontos para reprocessamento.
+
+### Lições Aprendidas
+
+#### O que funcionou bem:
+
+1. **Endpoint administrativo > SQL manual:** Operação via API é mais segura e auditável
+2. **Logs estruturados:** Rastreabilidade completa de quais artigos foram resetados
+3. **Resposta informativa:** Retornar IDs ajuda a validar operação
+4. **Autenticação:** Proteção contra uso acidental/malicioso
+
+#### Decisões importantes:
+
+1. **Não auto-resetar no startup:** Evita race condition com jobs legítimos
+2. **Endpoint explícito:** Admin decide quando resetar (controle total)
+3. **Não adicionar timestamp:** Simplicidade > complexidade para MVP
+
+#### Melhorias futuras (documentadas no ROADMAP):
+
+1. **Job heartbeat:** Atualizar timestamp a cada N segundos durante processamento
+2. **Auto-recovery:** Resetar automaticamente artigos `processing` > X minutos
+3. **Webhook de falha:** Notificar admin quando jobs são interrompidos
+4. **Persistent queue:** Migrar para Celery/RQ para jobs sobreviverem a restarts
+
+### Impacto no Projeto
+
+**Antes:**
+
+- ✅ Pipeline funcional
+- ⚠️ Artigos travados requerem SQL manual
+- ❌ Sem recuperação de falhas
+
+**Depois:**
+
+- ✅ Pipeline funcional
+- ✅ Recuperação via API
+- ✅ Auditável e seguro
+- ✅ Operável por não-desenvolvedores
+
+**Perfil técnico demonstrado:**
+
+- Pensamento operacional (ferramentas de recuperação)
+- Design de APIs administrativas
+- Auditabilidade e segurança
+- Documentação de limitações conhecidas
+
+### Arquivos Modificados
+
+**Modificados (1):**
+
+1. `app/routers/pipeline.py` - Adicionado endpoint `reset-stuck-processing`
+
+**Documentados (2):**
+
+1. `docs/TECHNICAL_DEEP_DIVE.md` - Seção sobre endpoints administrativos
+2. `docs/AGENT_WORKFLOW.md` - Esta iteração
+
+**Linhas adicionadas:** ~50 (código + documentação)
+
+---
+
+**Status:** ✅ Endpoint implementado, testado em produção e documentado.

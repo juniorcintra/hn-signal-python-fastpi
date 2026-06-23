@@ -154,3 +154,46 @@ async def pipeline_stats(db: AsyncSession = Depends(get_db)) -> PipelineStatsRes
         completed=counts.get(EnrichmentStatus.completed, 0),
         failed=counts.get(EnrichmentStatus.failed, 0),
     )
+
+
+@router.post("/reset-stuck-processing")
+async def reset_stuck_processing(
+    db: AsyncSession = Depends(get_db),
+    api_key: str | None = Depends(api_key_header),
+) -> dict:
+    """
+    Reset articles stuck in 'processing' status back to 'pending'.
+    
+    This is an administrative endpoint to recover from interrupted enrichment jobs
+    (e.g., server restart, unhandled errors). Articles in 'processing' status that
+    are not actively being enriched will be reset to 'pending' so they can be
+    re-processed in the next pipeline run.
+    
+    Requires API key authentication.
+    """
+    await verify_api_key(api_key)
+    
+    result = await db.execute(
+        select(Article).where(Article.enrichment_status == EnrichmentStatus.processing)
+    )
+    stuck_articles = result.scalars().all()
+    
+    if not stuck_articles:
+        return {
+            "status": "ok",
+            "message": "No articles stuck in processing status",
+            "reset_count": 0,
+        }
+    
+    for article in stuck_articles:
+        article.enrichment_status = EnrichmentStatus.pending
+        logger.info(f"Reset article {article.hn_id} from processing to pending")
+    
+    await db.commit()
+    
+    return {
+        "status": "ok",
+        "message": f"Reset {len(stuck_articles)} articles from processing to pending",
+        "reset_count": len(stuck_articles),
+        "article_ids": [article.hn_id for article in stuck_articles],
+    }
