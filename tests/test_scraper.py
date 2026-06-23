@@ -1,13 +1,13 @@
 """
 Unit tests for the HN scraper parser.
 
-All tests are pure (no network calls) — they exercise _parse_articles and
-_parse_int with controlled HTML fixtures.
+All tests are pure (no network calls) — they exercise HNScraper.parse and
+HNScraper._parse_int with controlled HTML fixtures.
 """
 
 import pytest
 
-from app.scraper.hn_scraper import _parse_articles, _parse_int
+from app.scraper.hn_scraper import HNScraper
 
 # ---------------------------------------------------------------------------
 # Minimal HTML that mirrors the real HN structure the parser depends on
@@ -68,40 +68,43 @@ _FIXTURE_EMPTY = """<!doctype html><html><body><table></table></body></html>"""
 
 
 # ---------------------------------------------------------------------------
-# _parse_int
+# HNScraper._parse_int
 # ---------------------------------------------------------------------------
 
 class TestParseInt:
     def test_extracts_integer_from_text(self):
-        assert _parse_int("42 points") == 42
+        assert HNScraper._parse_int("42 points") == 42
 
     def test_extracts_from_comment_text(self):
-        assert _parse_int("15 comments") == 15
+        assert HNScraper._parse_int("15 comments") == 15
 
     def test_returns_zero_for_none(self):
-        assert _parse_int(None) == 0
+        assert HNScraper._parse_int(None) == 0
 
     def test_returns_zero_for_no_digits(self):
-        assert _parse_int("discuss") == 0
+        assert HNScraper._parse_int("discuss") == 0
 
     def test_returns_zero_for_empty_string(self):
-        assert _parse_int("") == 0
+        assert HNScraper._parse_int("") == 0
 
     def test_extracts_first_integer(self):
-        assert _parse_int("100 points by 3 users") == 100
+        assert HNScraper._parse_int("100 points by 3 users") == 100
 
 
 # ---------------------------------------------------------------------------
-# _parse_articles
+# HNScraper.parse
 # ---------------------------------------------------------------------------
 
 class TestParseArticles:
+    def setup_method(self):
+        self.scraper = HNScraper()
+
     def test_returns_two_items(self):
-        articles = _parse_articles(_FIXTURE_TWO_ITEMS)
+        articles = self.scraper.parse(_FIXTURE_TWO_ITEMS)
         assert len(articles) == 2
 
     def test_first_item_fields(self):
-        articles = _parse_articles(_FIXTURE_TWO_ITEMS)
+        articles = self.scraper.parse(_FIXTURE_TWO_ITEMS)
         first = articles[0]
         assert first["hn_id"] == "11111"
         assert first["title"] == "Example Article"
@@ -112,20 +115,21 @@ class TestParseArticles:
         assert first["comments_count"] == 15
 
     def test_hn_relative_link_is_normalised(self):
-        articles = _parse_articles(_FIXTURE_TWO_ITEMS)
+        articles = self.scraper.parse(_FIXTURE_TWO_ITEMS)
         second = articles[1]
         assert second["url"].startswith("https://news.ycombinator.com/item?")
 
     def test_missing_score_defaults_to_zero(self):
-        articles = _parse_articles(_FIXTURE_MISSING_SCORE)
+        articles = self.scraper.parse(_FIXTURE_MISSING_SCORE)
         assert len(articles) == 1
         assert articles[0]["points"] == 0
         assert articles[0]["author"] == "carol"
 
     def test_empty_html_returns_empty_list(self):
-        assert _parse_articles(_FIXTURE_EMPTY) == []
+        assert self.scraper.parse(_FIXTURE_EMPTY) == []
 
     def test_each_item_has_required_keys(self):
         required = {"hn_id", "title", "url", "points", "comments_count", "author", "rank"}
-        for article in _parse_articles(_FIXTURE_TWO_ITEMS):
+        articles = self.scraper.parse(_FIXTURE_TWO_ITEMS)
+        for article in articles:
             assert required.issubset(article.keys())
